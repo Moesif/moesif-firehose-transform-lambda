@@ -1,8 +1,3 @@
-"""Tests for the sampling logic.
-
-Run from the project root: python3 -m unittest discover -s tests -v
-"""
-
 import base64
 import json
 import os
@@ -13,11 +8,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-# The function lives at the project root, one level up from this file.
+# The lambda function lives at the project root, one level up from this file.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import lambda_function as lf
-
 
 def event(**overrides):
     base = {
