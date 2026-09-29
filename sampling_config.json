@@ -1,22 +1,12 @@
 {
   "_comment": [
     "Rules are evaluated in order; the first one whose conditions ALL match wins.",
+    "Order matters: put the keep-everything rules first, or they get sampled away.",
     "Events matching nothing use default_sample_rate.",
     "sample_rate is a percentage: 100 keeps everything, 10 keeps ~1 in 10, 0 drops all.",
-    "Survivors get weight = floor(100 / sample_rate) so Moesif extrapolates back.",
-    "Prefer rates that divide 100 evenly (50, 25, 20, 10, 5, 4, 2, 1) -- others",
-    "round the weight down and under-report.",
-    "",
-    "Order matters: put the keep-everything rules first, or they get sampled away.",
-    "Ships keeping everything. Add rules here, or override the whole file with the",
-    "SAMPLING_CONFIG env var -- either way, no code change.",
-    "",
-    "operators: equals not_equals in not_in regex contains gt gte lt lte between",
-    "           exists not_exists     (+ \"ignore_case\": true on string compares)",
+    "Prefer rates that divide 100 evenly (50, 25, 20, 10, 5, 4, 2, 1).",
     "paths are dotted: response.status, request.verb, request.headers.x-client-id",
-    "request.route is derived from request.uri: the path only, no host or query",
-    "",
-    "Rename _example_rules to rules to switch the example on."
+    "operator is one of: equals, not_equals, in, not_in, regex, contains, gt, gte, lt, lte, between, exists, not_exists"
   ],
 
   "default_sample_rate": 100,
@@ -47,7 +37,7 @@
       "name": "high-volume client: successful reads at 10%",
       "sample_rate": 10,
       "conditions": [
-        { "path": "company_id", "operator": "equals", "value": "REPLACE_ME" },
+        { "path": "company_id", "operator": "equals", "value": "acme-corp" },
         { "path": "response.status", "operator": "between", "value": [200, 399] }
       ]
     }
