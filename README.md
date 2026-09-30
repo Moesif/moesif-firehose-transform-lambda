@@ -14,7 +14,7 @@ your API ──▶ Firehose ──▶ [ transform Lambda ] ──▶ Moesif
 ```
 
 Your integration does not change. The delivery stream, its destination and your
-producers stay exactly as they are - Firehose simply invokes this function on
+producers stay exactly as they are. Firehose simply invokes this function on
 each batch before delivering it.
 
 ## Why a transform Lambda
@@ -28,9 +28,9 @@ Control how many events reach Moesif. Drop traffic with no analytical value,
 and sample high-volume traffic down to a representative fraction while keeping
 your volume metrics accurate.
 
-Rules are **static and config-driven** and they live in `sampling_config.json` or
-the `SAMPLING_CONFIG` environment variable and are read once per cold start.
-Nothing is fetched at runtime, so there is no network dependency in the hot path.
+Rules are **managed in Moesif** and fetched at runtime, so rates change in the
+Moesif UI without touching the function. The sampling decision itself is made
+from a cached config, so no record waits on a network call.
 
 ---
 
@@ -55,7 +55,7 @@ for.
 Counts, volume charts and trends stay accurate. You are storing less, not
 reporting less.
 
-Use a rate that divides 100 evenly such as 50, 25, 20, 10, 5, 4, 2 or 1. Anything else
+Use a rate that divides 100 evenly, such as 50, 25, 20, 10, 5, 4, 2 or 1. Anything else
 reports a little under the true count.
 
 ### What you give up
@@ -70,99 +70,77 @@ requests are not kept or dropped together.
 
 ## Dependencies
 
-No dependencies, Python standard library only.
+No dependencies. Python standard library only.
 
 ---
 
 ## Configuring rules
 
-Rules are evaluated **in order, and the first rule whose conditions all match
-wins**. Conditions within a rule are ANDed. Events matching no rule get
-`default_sample_rate`.
+Rules come from Moesif. Set one environment variable and the function fetches
+them:
 
-```json
-{
-  "default_sample_rate": 100,
-  "rules": [
-    { "name": "keep all errors", "sample_rate": 100,
-      "conditions": [ { "path": "response.status", "operator": "gte", "value": 400 } ] },
-
-    { "name": "drop health checks", "sample_rate": 0,
-      "conditions": [ { "path": "request.route", "operator": "regex", "value": "^/health/?$" } ] },
-
-    { "name": "high-volume client, successful reads", "sample_rate": 10,
-      "conditions": [ { "path": "company_id", "value": "acme-corp" },
-                      { "path": "response.status", "operator": "between", "value": [200, 399] } ] }
-  ]
-}
+```
+MOESIF_APPLICATION_ID = <your Application Id>
 ```
 
-> **Order matters.** Rules that protect traffic (`sample_rate: 100`) and rules
-> that remove it (`sample_rate: 0`) must come before the rules that sample, or
-> the sampling rule will match first and win.
+It fetches the config and applies it. Change your sampling rates in Moesif and this
+function picks them up on its next refresh. Nothing is redeployed, and no rules
+live in the function.
 
-### `path`
+### What the config contains
 
-Dotted path into the event: `response.status`, `request.verb`,
-`request.headers.x-client-id`. Keys match exactly first, then case-insensitively,
-so header casing does not matter.
+| field | what it sets |
+|---|---|
+| `sample_rate` | the default rate for anything unmatched |
+| `user_sample_rate` | `{user_id: rate}` |
+| `company_sample_rate` | `{company_id: rate}` |
+| `regex_config` | rules matched on request and response fields |
 
-Match the field names your stream actually carries. A raw API Gateway access log
-is flat (`status`, `httpMethod`); a Moesif event model is nested
-(`response.status`, `request.verb`).
+Rates are resolved in this order, so the same config produces the same rate
+wherever it is applied:
 
-`request.route` is derived when the event has no such field: the URL path alone,
-without scheme, host or query string. Prefer it over `request.uri` for path
-rules, since `request.uri` holds the full URL and `^/v1/items$` will not match
-`https://api.example.com/v1/items?page=2`.
+```
+regex_config  ->  user_sample_rate  ->  company_sample_rate  ->  sample_rate
+```
 
-### `operator`
+Within `regex_config`, rules are evaluated in order and the first whose
+conditions all match wins. Put rules that protect traffic (`sample_rate: 100`)
+and rules that remove it (`sample_rate: 0`) before the rules that sample.
 
-| operator | `value` | matches when |
+### Settings
+
+Every setting is an environment variable. Nothing is hardcoded.
+
+| variable | default | |
 |---|---|---|
-| `equals` *(default)* | string, number, bool | equal, compared numerically when both sides are numbers, so `200` matches `"200"` |
-| `not_equals` | string, number, bool | not equal |
-| `in` | list | equal to any entry |
-| `not_in` | list | equal to no entry |
-| `regex` | pattern string | pattern found anywhere in the value |
-| `contains` | string | substring found anywhere |
-| `gt` `gte` `lt` `lte` | number | numeric comparison |
-| `between` | `[low, high]` | within range, both ends included |
-| `exists` | none | field present and not null |
-| `not_exists` | none | field absent or null |
+| `MOESIF_APPLICATION_ID` | none | set it to enable sampling |
+| `MOESIF_BASE_URI` | `https://api.moesif.net` | override for another region or a proxy |
+| `CONFIG_REFRESH_SECONDS` | `60` | how often to re-check while warm |
+| `CONFIG_FETCH_TIMEOUT_SECONDS` | `3` | how long to wait for Moesif |
+| `DEBUG` | off | set to `true` for verbose logging |
 
-Add `"ignore_case": true` to any string comparison.
+### How refresh works
 
-### `sample_rate`
+Since Lambda freezes the execution environment between invocations, the function
+checks on the invocation path, and only once `CONFIG_REFRESH_SECONDS` has
+elapsed. The ETag from the previous response goes back as `If-None-Match`, so an
+unchanged config costs a `304` and no body.
 
-A percentage from 0 to 100.
+With high Firehose concurrency, each warm instance refreshes independently, so
+raise the interval if many instances run at once.
 
-| value | effect |
-|---|---|
-| `100` | keep everything, so use it to protect traffic from later rules |
-| `10` | keep about 1 in 10, each stamped `weight: 10` |
-| `0` | drop unconditionally, **no weight stamped** |
+### When there are no rules
 
-Rate `0` removes events from Moesif entirely rather than sampling them, so
-reserve it for traffic you never want counted, such as health checks and CORS
-preflight.
+**Without rules, nothing is sampled and every event reaches Moesif.** That is
+the state when `MOESIF_APPLICATION_ID` is not set, and on a cold start when
+Moesif could not be reached.
 
-Prefer rates that divide 100 evenly: **50, 25, 20, 10, 5, 4, 2, 1**. Weight is
-`floor(100 / rate)`, so other values round down: rate 30 gives weight 3 and
-extrapolates to 90% of true volume.
+Failures never stop delivery. If Moesif is unreachable, returns an error, or
+sends something unparseable, the function keeps using the config it already has
+and retries on the next interval rather than on every invocation.
 
-### Where the config comes from
-
-Checked in this order:
-
-| source | use when |
-|---|---|
-| `SAMPLING_CONFIG` env var (inline JSON) | rules change often, no redeploy needed |
-| `SAMPLING_CONFIG_PATH` env var (file path) | several environments, or a Lambda layer |
-| `sampling_config.json` beside the code | rules are stable and belong in version control |
-
-Note that Lambda caps all environment variables at 4 KB combined, so large rule
-sets belong in the bundled file.
+The summary log line reports the config in use via `config_source`, and
+`config_valid: false` means no rules are in effect.
 
 ---
 
@@ -170,7 +148,7 @@ sets belong in the bundled file.
 
 1. Package the function:
    ```bash
-   zip function.zip lambda_function.py sampling_config.json
+   zip function.zip lambda_function.py
    ```
 2. Create the Lambda with Python 3.12 or later, handler
    `lambda_function.lambda_handler`, timeout **60 seconds** (the 3-second default
@@ -180,9 +158,8 @@ sets belong in the bundled file.
    starting point.
 4. Grant the delivery stream's IAM role `lambda:InvokeFunction` on the function.
 
-To change rules later, update the `SAMPLING_CONFIG` environment variable. Saving
-it recycles the execution environment, and the next invocation picks up the new
-rules. No redeploy is needed.
+Set `MOESIF_APPLICATION_ID` on the function. Rules are then managed in Moesif and
+picked up on the next refresh, with no redeploy.
 
 ---
 
@@ -193,7 +170,7 @@ Each invocation emits one structured log line:
 ```json
 {"msg": "firehose_sampling_summary", "records_in": 500, "events_in": 500,
  "events_kept": 61, "events_dropped": 439, "records_dropped": 439,
- "config_valid": true}
+ "config_source": "moesif:/v1/config", "config_valid": true}
 ```
 
 ```
@@ -204,9 +181,10 @@ fields @timestamp, events_in, events_kept, events_dropped
 
 Two things to watch:
 
-- **`config_valid: false`**: the config failed to parse and every event is being
-  kept. Worth an alarm.
-- **`events_dropped: 0`** when you expect otherwise, usually a rule referencing a
+- **`config_valid: false`**: no rules are in effect and every event is being
+  kept, either because `MOESIF_APPLICATION_ID` is unset or because Moesif could
+  not be reached on the cold start. Worth an alarm.
+- **`events_dropped: 0`** when you expect otherwise: usually a rule referencing a
   field name your stream does not carry.
 
 ---
@@ -230,10 +208,8 @@ request id would avoid this and is a change to `should_keep()`.
 extrapolates as you expect in Moesif before relying on these numbers for
 reporting or billing.
 
-**Static rules only, for now.** Rules change when you change the configuration.
-There is no fetch from the Moesif API, no ETag handling, and no governance rules.
-Dynamic sampling is the intended next capability for this function; see
-*What it does today* above.
+**No governance rules.** This function samples and filters; it does not block or
+transform requests the way an SDK's governance rules can.
 
 ---
 
