@@ -1,6 +1,6 @@
 """Firehose transform Lambda: sample API events before Moesif.
 
-Static rules from SAMPLING_CONFIG or sampling_config.json; nothing fetched at runtime.
+Rules are fetched from Moesif with MOESIF_APPLICATION_ID. Without them nothing is sampled.
 
     rate   = first matching rule, else default_sample_rate
     keep   = random() * 100 < rate
@@ -16,49 +16,43 @@ import math
 import os
 import random
 import re
+import time
+import urllib.error
+import urllib.request
 
 logger = logging.getLogger()
-logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+# DEBUG turns on verbose logging.
+DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
 MISSING = object()  # Distinguishes an absent field from a JSON null
-_CONFIG = None
+
+DEFAULT_BASE_URI = "https://api.moesif.net"
+
+_CONFIG = None      # the config in use
+_ETAG = None        # ETag of the last config fetched from Moesif
+_FETCHED_AT = 0.0   # monotonic time of the last fetch attempt
 
 
 # --- config -------------------------------------------------------------------
 
-def load_config():
-    """Read the config. Falls back to keeping everything."""
-    keep_all = {"default_sample_rate": 100.0, "rules": [], "valid": True}
-    try:
-        inline = os.environ.get("SAMPLING_CONFIG", "").strip()
-        if inline:
-            raw, source = json.loads(inline), "env:SAMPLING_CONFIG"
-        else:
-            path = os.environ.get("SAMPLING_CONFIG_PATH") or os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "sampling_config.json"
-            )
-            with open(path, encoding="utf-8") as handle:
-                raw, source = json.load(handle), path
-
-        config = {
-            "default_sample_rate": _rate(raw.get("default_sample_rate", 100)),
-            "rules": [_parse_rule(r, i) for i, r in enumerate(raw.get("rules", []))],
-            "source": source,
-            "valid": True,
-        }
-        logger.info("Loaded sampling config from %s: %s", source,
-                    [(r["name"], r["sample_rate"]) for r in config["rules"]])
-        return config
-    except Exception as exc:
-        logger.error("Bad or missing sampling config (%s); keeping all events", exc)
-        keep_all["valid"] = False
-        return keep_all
+def keep_everything(reason):
+    """The config used when Moesif has not supplied one: sample nothing."""
+    return {"default_sample_rate": 100.0, "rules": [], "user_sample_rate": {},
+            "company_sample_rate": {}, "source": reason, "valid": False}
 
 
 def _rate(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 100:
         raise ValueError("sample_rate must be a number 0-100, got %r" % (value,))
     return float(value)
+
+
+def _rate_map(raw):
+    """Validate a {id: sample_rate} map, as used for users and companies."""
+    if not isinstance(raw, dict):
+        return {}
+    return {str(key): _rate(value) for key, value in raw.items()}
 
 
 def _parse_rule(raw, index):
@@ -89,6 +83,92 @@ def _parse_condition(raw):
         condition["regex"] = re.compile(str(raw.get("value")),
                                         re.IGNORECASE if condition["ignore_case"] else 0)
     return condition
+
+
+# --- dynamic config from Moesif ----------------------------------------------
+
+def dynamic_config_enabled():
+    return bool(os.environ.get("MOESIF_APPLICATION_ID", "").strip())
+
+
+def _refresh_seconds():
+    try:
+        return max(0.0, float(os.environ.get("CONFIG_REFRESH_SECONDS", 60)))
+    except ValueError:
+        return 60.0
+
+
+def fetch_remote_config():
+    """GET /v1/config. Returns a config, or None to keep the current one."""
+
+    global _ETAG
+
+    app_id = os.environ.get("MOESIF_APPLICATION_ID", "").strip()
+    if not app_id:
+        return None
+
+    url = os.environ.get("MOESIF_BASE_URI", DEFAULT_BASE_URI).rstrip("/") + "/v1/config"
+    headers = {"X-Moesif-Application-Id": app_id,
+               "Content-Type": "application/json; charset=utf-8"}
+    if _ETAG:
+        headers["If-None-Match"] = _ETAG
+
+    try:
+        timeout = float(os.environ.get("CONFIG_FETCH_TIMEOUT_SECONDS", 3))
+    except ValueError:
+        timeout = 3.0
+
+    try:
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8")
+            _ETAG = response.headers.get("X-Moesif-Config-ETag") or _ETAG
+            return _from_moesif_config(json.loads(body))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            logger.debug("Moesif config unchanged (304)")
+        elif 401 <= exc.code <= 403:
+            logger.error("Unauthorized fetching Moesif config; check MOESIF_APPLICATION_ID")
+        else:
+            logger.warning("Moesif config fetch returned status %s", exc.code)
+    except Exception as exc:
+        logger.warning("Moesif config fetch failed (%s); keeping the current config", exc)
+    return None
+
+
+def _from_moesif_config(raw):
+    """Translate a Moesif /v1/config document into this function's config shape."""
+    if not isinstance(raw, dict):
+        raise ValueError("config must be an object")
+
+    rules = []
+    for index, entry in enumerate(raw.get("regex_config") or []):
+        conditions = [{"path": c.get("path"), "operator": "regex", "value": c.get("value")}
+                      for c in entry.get("conditions") or []]
+        try:
+            rules.append(_parse_rule({"name": "regex_config[%d]" % index,
+                                      "sample_rate": entry.get("sample_rate"),
+                                      "conditions": conditions}, index))
+        except Exception as exc:
+            # One unusable entry should not cost us the rest of the config.
+            logger.warning("Skipping regex_config[%d] from Moesif: %s", index, exc)
+
+    return {
+        "default_sample_rate": _rate(raw.get("sample_rate", 100)),
+        "rules": rules,
+        "user_sample_rate": _rate_map(raw.get("user_sample_rate")),
+        "company_sample_rate": _rate_map(raw.get("company_sample_rate")),
+        "source": "moesif:/v1/config",
+        "valid": True,
+    }
+
+
+def samples_everything(config):
+    """True when no rule can drop anything, so records need not be decoded."""
+    return (config["default_sample_rate"] >= 100
+            and not config["rules"]
+            and not config.get("user_sample_rate")
+            and not config.get("company_sample_rate"))
 
 
 # --- rule matching ------------------------------------------------------------
@@ -179,9 +259,7 @@ def _route(event):
     return extracted.group(1) if extracted else "/"
 
 
-# Paths computed from the event rather than read off it. request.route is
-# derived the same way the Moesif SDKs derive it, so a rule written against
-# either matches identically.
+# Paths computed from the event rather than read off it.
 DERIVED = {"request.route": _route}
 
 
@@ -200,13 +278,26 @@ def _matches(condition, event):
 
 
 def resolve_rate(event, config):
-    """First rule whose conditions all match wins; otherwise the default."""
+    """Rules first, then per-user, then per-company, then the default."""
     for rule in config["rules"]:
         try:
             if all(_matches(c, event) for c in rule["conditions"]):
                 return rule["sample_rate"], rule["name"]
         except Exception:
             logger.warning("Rule %r failed to match; skipping", rule["name"], exc_info=True)
+
+    user_rates = config.get("user_sample_rate") or {}
+    if user_rates:
+        user_id = get_path(event, "user_id")
+        if isinstance(user_id, str) and user_id in user_rates:
+            return user_rates[user_id], "user:" + user_id
+
+    company_rates = config.get("company_sample_rate") or {}
+    if company_rates:
+        company_id = get_path(event, "company_id")
+        if isinstance(company_id, str) and company_id in company_rates:
+            return company_rates[company_id], "company:" + company_id
+
     return config["default_sample_rate"], None
 
 
@@ -253,16 +344,43 @@ def sample(event, config):
 
 # --- Firehose handler ---------------------------------------------------------
 
+def get_config():
+    """The config in use, refreshed from Moesif when the interval has elapsed."""
+    global _CONFIG, _FETCHED_AT
+    now = time.monotonic()
+
+    if _CONFIG is None:
+        _FETCHED_AT = now
+        _CONFIG = fetch_remote_config()
+        if _CONFIG is None:
+            # No rules yet, so nothing is sampled. The next interval tries again.
+            reason = ("no MOESIF_APPLICATION_ID set" if not dynamic_config_enabled()
+                      else "Moesif config unavailable")
+            _CONFIG = keep_everything(reason)
+            logger.warning("Keeping all events: %s", reason)
+        else:
+            logger.info("Sampling config loaded from Moesif: default %g%%, %d rule(s)",
+                        _CONFIG["default_sample_rate"], len(_CONFIG["rules"]))
+    elif dynamic_config_enabled() and now - _FETCHED_AT >= _refresh_seconds():
+        # Stamp the attempt before making it, so a failing endpoint is retried
+        # on the interval rather than on every invocation.
+        _FETCHED_AT = now
+        fresh = fetch_remote_config()
+        if fresh:
+            _CONFIG = fresh
+            logger.info("Sampling config refreshed from Moesif: default %g%%, %d rule(s)",
+                        fresh["default_sample_rate"], len(fresh["rules"]))
+
+    return _CONFIG
+
+
 def lambda_handler(event, context=None):
     """One result per record, in order. Sampled-out records are marked Dropped.
 
     ProcessingFailed is never returned: it would route records to the delivery
     stream's error output. Records that cannot be read pass through unchanged.
     """
-    global _CONFIG
-    if _CONFIG is None:
-        _CONFIG = load_config()
-    config = _CONFIG
+    config = get_config()
 
     records, stats = [], {"in": 0, "kept": 0, "dropped": 0, "records_dropped": 0}
     for record in event.get("records") or []:
@@ -275,6 +393,7 @@ def lambda_handler(event, context=None):
     logger.info(json.dumps({
         "msg": "firehose_sampling_summary",
         "invocationId": event.get("invocationId"),
+        "config_source": config.get("source", "unknown"),
         "config_valid": config["valid"],
         "records_in": len(records),
         "records_dropped": stats["records_dropped"],
@@ -287,7 +406,7 @@ def lambda_handler(event, context=None):
 
 def _process(record, config, stats):
     # Nothing can be dropped, so skip decoding entirely.
-    if config["default_sample_rate"] >= 100 and not config["rules"]:
+    if samples_everything(config):
         return _passthrough(record)
 
     try:
