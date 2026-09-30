@@ -24,8 +24,11 @@ def event(**overrides):
     return base
 
 
-def config(rules=(), default=100):
-    return {"default_sample_rate": float(default), "rules": list(rules), "valid": True}
+def config(rules=(), default=100, user_sample_rate=None, company_sample_rate=None):
+    return {"default_sample_rate": float(default), "rules": list(rules),
+            "user_sample_rate": user_sample_rate or {},
+            "company_sample_rate": company_sample_rate or {},
+            "source": "test", "valid": True}
 
 
 def rule(name, rate, conditions):
@@ -89,7 +92,7 @@ class TestOperators(unittest.TestCase):
         self.assertFalse(self.match(path="user_id", operator="exists"))
 
     def test_request_route_strips_scheme_host_and_query(self):
-        # Matches the SDK, so an anchored rule ports across unchanged.
+        # request.route is the path alone, so an anchored rule matches it.
         self.assertTrue(self.match(path="request.route", operator="regex", value="^/v1/items$"))
         self.assertFalse(self.match(path="request.uri", operator="regex", value="^/v1/items$"))
 
@@ -132,7 +135,7 @@ class TestKeepDropWeight(unittest.TestCase):
         self.assertNotIn("weight", payload)      # An absent weight means 1
 
     def test_existing_weight_is_overwritten(self):
-        # Matches the SDKs, which assign weight unconditionally.
+        # Weight is assigned unconditionally, not combined with what was there.
         payload = event(weight=10)
         lf.stamp_weight(payload, 50)
         self.assertEqual(payload["weight"], 2)
@@ -212,37 +215,44 @@ class TestFirehoseContract(unittest.TestCase):
         self.assertEqual(lf.lambda_handler({"records": []}), {"records": []})
 
 
-class TestConfigLoading(unittest.TestCase):
+class TestKeepEverythingFallback(unittest.TestCase):
+    """With no rules from Moesif, nothing is sampled."""
+
+    def setUp(self):
+        lf._CONFIG = None
+        os.environ.pop("MOESIF_APPLICATION_ID", None)
+
     def tearDown(self):
-        os.environ.pop("SAMPLING_CONFIG", None)
         lf._CONFIG = None
+        os.environ.pop("MOESIF_APPLICATION_ID", None)
 
-    def test_reads_inline_json(self):
-        os.environ["SAMPLING_CONFIG"] = json.dumps({"default_sample_rate": 25, "rules": []})
-        cfg = lf.load_config()
-        self.assertTrue(cfg["valid"])
-        self.assertEqual(cfg["default_sample_rate"], 25.0)
-
-    def test_bundled_file_is_the_fallback(self):
-        cfg = lf.load_config()
-        self.assertTrue(cfg["valid"])
+    def test_no_application_id_means_no_sampling(self):
+        cfg = lf.get_config()
         self.assertEqual(cfg["default_sample_rate"], 100.0)
+        self.assertEqual(cfg["rules"], [])
+        self.assertTrue(lf.samples_everything(cfg))
 
-    def test_bad_config_keeps_everything(self):
-        for broken in ["{not json", json.dumps({"default_sample_rate": 500}),
-                       json.dumps({"rules": [{"sample_rate": 10, "conditions": []}]})]:
-            os.environ["SAMPLING_CONFIG"] = broken
-            cfg = lf.load_config()
-            self.assertFalse(cfg["valid"])
-            self.assertEqual(cfg["default_sample_rate"], 100.0)
-            self.assertEqual(cfg["rules"], [])
+    def test_the_fallback_is_flagged_as_not_configured(self):
+        cfg = lf.get_config()
+        self.assertFalse(cfg["valid"])
+        self.assertIn("MOESIF_APPLICATION_ID", cfg["source"])
 
-    def test_a_bad_config_still_passes_events_through(self):
-        os.environ["SAMPLING_CONFIG"] = "{broken"
-        lf._CONFIG = None
-        out = lf.lambda_handler(firehose(json.dumps(event())))["records"][0]
-        self.assertEqual(out["result"], "Ok")
+    def test_no_application_id_makes_no_network_call(self):
+        with mock.patch.object(lf.urllib.request, "urlopen") as opened:
+            lf.get_config()
+        opened.assert_not_called()
 
+    def test_every_event_passes_through(self):
+        out = lf.lambda_handler(firehose(json.dumps(event()), json.dumps(event())))
+        self.assertEqual([r["result"] for r in out["records"]], ["Ok", "Ok"])
+
+    def test_an_unreachable_moesif_means_no_sampling(self):
+        os.environ["MOESIF_APPLICATION_ID"] = "test-app-id"
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("down")):
+            cfg = lf.get_config()
+        self.assertTrue(lf.samples_everything(cfg))
+        self.assertFalse(cfg["valid"])
+        self.assertIn("unavailable", cfg["source"])
 
 
 class TestPathLookup(unittest.TestCase):
@@ -410,7 +420,7 @@ class TestRouteDerivation(unittest.TestCase):
         self.assertEqual(lf._route({"request": {"uri": "https://api.x.com"}}), "/")
 
     def test_a_relative_uri_becomes_slash(self):
-        # Same as the SDK: the regex requires scheme and host to match.
+        # The pattern requires scheme and host, so a relative URI yields '/'.
         self.assertEqual(lf._route({"request": {"uri": "/v1/items"}}), "/")
 
     def test_a_non_string_uri_is_missing(self):
@@ -501,55 +511,6 @@ class TestHandlerEdgeCases(unittest.TestCase):
         self.assertIsNotNone(out["data"])
 
 
-class TestConfigSources(unittest.TestCase):
-    def tearDown(self):
-        for key in ("SAMPLING_CONFIG", "SAMPLING_CONFIG_PATH"):
-            os.environ.pop(key, None)
-        lf._CONFIG = None
-
-    def write(self, payload):
-        path = os.path.join(tempfile.mkdtemp(), "config.json")
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-        return path
-
-    def test_reads_a_file_path(self):
-        os.environ["SAMPLING_CONFIG_PATH"] = self.write({"default_sample_rate": 42, "rules": []})
-        self.assertEqual(lf.load_config()["default_sample_rate"], 42.0)
-
-    def test_inline_json_beats_a_file_path(self):
-        os.environ["SAMPLING_CONFIG_PATH"] = self.write({"default_sample_rate": 42, "rules": []})
-        os.environ["SAMPLING_CONFIG"] = json.dumps({"default_sample_rate": 7, "rules": []})
-        self.assertEqual(lf.load_config()["default_sample_rate"], 7.0)
-
-    def test_a_blank_env_var_is_ignored(self):
-        os.environ["SAMPLING_CONFIG_PATH"] = self.write({"default_sample_rate": 42, "rules": []})
-        os.environ["SAMPLING_CONFIG"] = "   "
-        self.assertEqual(lf.load_config()["default_sample_rate"], 42.0)
-
-    def test_a_missing_file_fails_open(self):
-        os.environ["SAMPLING_CONFIG_PATH"] = "/nonexistent/config.json"
-        loaded = lf.load_config()
-        self.assertFalse(loaded["valid"])
-        self.assertEqual(loaded["default_sample_rate"], 100.0)
-
-    def test_a_non_object_root_fails_open(self):
-        os.environ["SAMPLING_CONFIG"] = "[1, 2, 3]"
-        self.assertFalse(lf.load_config()["valid"])
-
-    def test_config_is_cached_across_invocations(self):
-        os.environ["SAMPLING_CONFIG"] = json.dumps({"default_sample_rate": 100, "rules": []})
-        lf._CONFIG = None
-        lf.lambda_handler({"records": []})
-        first = lf._CONFIG
-        lf.lambda_handler({"records": []})
-        self.assertIs(lf._CONFIG, first)
-
-    def test_the_shipped_config_file_is_valid(self):
-        loaded = lf.load_config()
-        self.assertTrue(loaded["valid"], loaded)
-
-
 class TestSummaryLog(unittest.TestCase):
     def tearDown(self):
         lf._CONFIG = None
@@ -603,6 +564,385 @@ class TestSamplingDistribution(unittest.TestCase):
         random.seed(1)
         self.assertEqual(sum(lf.should_keep(0) for _ in range(1000)), 0)
         self.assertEqual(sum(lf.should_keep(100) for _ in range(1000)), 1000)
+
+
+
+MOESIF_CONFIG = {
+    "org_id": "org-1",
+    "app_id": "app-1",
+    "sample_rate": 80,
+    "user_sample_rate": {"u-1001": 10},
+    "company_sample_rate": {"acme-corp": 25},
+    "regex_config": [
+        {"sample_rate": 5,
+         "conditions": [{"path": "request.route", "value": "^/v1/items"},
+                        {"path": "request.verb", "value": "GET"}]}
+    ],
+}
+
+
+class FakeResponse:
+    """Stands in for the object urlopen returns."""
+
+    def __init__(self, body, etag=None):
+        self._body = json.dumps(body).encode()
+        self.headers = {"X-Moesif-Config-ETag": etag} if etag else {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def http_error(code):
+    return lf.urllib.error.HTTPError("http://x", code, "err", {}, None)
+
+
+class DynamicConfigBase(unittest.TestCase):
+    def setUp(self):
+        lf._CONFIG = None
+        lf._ETAG = None
+        lf._FETCHED_AT = 0.0
+        os.environ["MOESIF_APPLICATION_ID"] = "test-app-id"
+
+    def tearDown(self):
+        lf._CONFIG = None
+        lf._ETAG = None
+        lf._FETCHED_AT = 0.0
+        for key in ("MOESIF_APPLICATION_ID", "MOESIF_BASE_URI",
+                    "CONFIG_REFRESH_SECONDS", "CONFIG_FETCH_TIMEOUT_SECONDS"):
+            os.environ.pop(key, None)
+
+
+class TestMoesifConfigTranslation(DynamicConfigBase):
+    def test_regex_config_becomes_rules(self):
+        cfg = lf._from_moesif_config(MOESIF_CONFIG)
+        self.assertEqual(len(cfg["rules"]), 1)
+        rule = cfg["rules"][0]
+        self.assertEqual(rule["sample_rate"], 5.0)
+        self.assertTrue(all(c["operator"] == "regex" for c in rule["conditions"]))
+
+    def test_sample_rate_becomes_the_default(self):
+        self.assertEqual(lf._from_moesif_config(MOESIF_CONFIG)["default_sample_rate"], 80.0)
+
+    def test_user_and_company_maps_are_carried_over(self):
+        cfg = lf._from_moesif_config(MOESIF_CONFIG)
+        self.assertEqual(cfg["user_sample_rate"], {"u-1001": 10.0})
+        self.assertEqual(cfg["company_sample_rate"], {"acme-corp": 25.0})
+
+    def test_an_empty_config_is_keep_everything(self):
+        cfg = lf._from_moesif_config({})
+        self.assertEqual(cfg["default_sample_rate"], 100.0)
+        self.assertTrue(lf.samples_everything(cfg))
+
+    def test_one_bad_regex_entry_does_not_lose_the_rest(self):
+        raw = dict(MOESIF_CONFIG, regex_config=[
+            {"sample_rate": 500, "conditions": [{"path": "a", "value": "b"}]},   # bad rate
+            {"sample_rate": 5, "conditions": [{"path": "request.verb", "value": "GET"}]},
+        ])
+        cfg = lf._from_moesif_config(raw)
+        self.assertEqual(len(cfg["rules"]), 1)
+
+    def test_an_invalid_document_raises_so_the_caller_can_fall_back(self):
+        with self.assertRaises(Exception):
+            lf._from_moesif_config([1, 2, 3])
+
+
+class TestRatePrecedence(DynamicConfigBase):
+    """Rules, then user, then company, then default."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = lf._from_moesif_config(MOESIF_CONFIG)
+
+    def rate_for(self, **overrides):
+        e = {"user_id": "u-9", "company_id": "other",
+             "request": {"verb": "POST", "uri": "https://api.x.com/v1/other"},
+             "response": {"status": 200}}
+        e.update(overrides)
+        return lf.resolve_rate(e, self.cfg)
+
+    def test_regex_rule_beats_user_and_company(self):
+        rate, name = self.rate_for(user_id="u-1001", company_id="acme-corp",
+                                   request={"verb": "GET", "uri": "https://api.x.com/v1/items"})
+        self.assertEqual(rate, 5.0)
+        self.assertTrue(name.startswith("regex_config"))
+
+    def test_user_beats_company(self):
+        rate, name = self.rate_for(user_id="u-1001", company_id="acme-corp")
+        self.assertEqual((rate, name), (10.0, "user:u-1001"))
+
+    def test_company_applies_when_the_user_has_no_rate(self):
+        rate, name = self.rate_for(user_id="u-9", company_id="acme-corp")
+        self.assertEqual((rate, name), (25.0, "company:acme-corp"))
+
+    def test_default_when_nothing_matches(self):
+        self.assertEqual(self.rate_for()[0], 80.0)
+
+    def test_a_null_user_id_does_not_match_a_rate_map(self):
+        self.assertEqual(self.rate_for(user_id=None, company_id="acme-corp")[1], "company:acme-corp")
+
+
+class TestRemoteFetch(DynamicConfigBase):
+    def test_returns_none_without_an_application_id(self):
+        os.environ.pop("MOESIF_APPLICATION_ID")
+        self.assertIsNone(lf.fetch_remote_config())
+
+    def test_sends_the_application_id_and_reads_the_etag(self):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")) as opened:
+            cfg = lf.fetch_remote_config()
+
+        request = opened.call_args[0][0]
+        self.assertEqual(request.get_full_url(), "https://api.moesif.net/v1/config")
+        self.assertEqual(request.get_header("X-moesif-application-id"), "test-app-id")
+        self.assertEqual(lf._ETAG, "etag-1")
+        self.assertEqual(cfg["default_sample_rate"], 80.0)
+
+    def test_base_uri_is_configurable(self):
+        os.environ["MOESIF_BASE_URI"] = "https://api.moesif.com/"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG)) as opened:
+            lf.fetch_remote_config()
+        self.assertEqual(opened.call_args[0][0].get_full_url(), "https://api.moesif.com/v1/config")
+
+    def test_a_known_etag_is_sent_back_as_if_none_match(self):
+        lf._ETAG = "etag-1"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-2")) as opened:
+            lf.fetch_remote_config()
+        self.assertEqual(opened.call_args[0][0].get_header("If-none-match"), "etag-1")
+
+    def test_304_keeps_the_current_config(self):
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=http_error(304)):
+            self.assertIsNone(lf.fetch_remote_config())
+
+    def test_unauthorized_is_reported_and_does_not_raise(self):
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=http_error(401)):
+            with self.assertLogs(level="ERROR") as captured:
+                self.assertIsNone(lf.fetch_remote_config())
+        self.assertIn("MOESIF_APPLICATION_ID", "".join(captured.output))
+
+    def test_a_network_failure_does_not_raise(self):
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("timeout")):
+            self.assertIsNone(lf.fetch_remote_config())
+
+    def test_a_malformed_body_does_not_raise(self):
+        broken = mock.MagicMock()
+        broken.__enter__ = lambda self: self
+        broken.__exit__ = lambda self, *a: False
+        broken.read = lambda: b"{not json"
+        broken.headers = {}
+        with mock.patch.object(lf.urllib.request, "urlopen", return_value=broken):
+            self.assertIsNone(lf.fetch_remote_config())
+
+
+class TestGetConfig(DynamicConfigBase):
+    def test_cold_start_prefers_moesif(self):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")):
+            cfg = lf.get_config()
+        self.assertEqual(cfg["source"], "moesif:/v1/config")
+        self.assertEqual(cfg["default_sample_rate"], 80.0)
+
+    def test_a_failed_cold_start_samples_nothing_until_the_next_refresh(self):
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("down")):
+            cfg = lf.get_config()
+        self.assertTrue(lf.samples_everything(cfg))
+
+        lf._FETCHED_AT -= 3600
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")):
+            cfg = lf.get_config()
+        self.assertEqual(cfg["default_sample_rate"], 80.0)
+
+    def test_the_config_is_cached_between_invocations(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "3600"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")):
+            first = lf.get_config()
+            second = lf.get_config()
+        self.assertIs(first, second)
+
+    def test_it_does_not_refetch_before_the_interval_elapses(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "3600"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")) as opened:
+            lf.get_config()
+            lf.get_config()
+            lf.get_config()
+        self.assertEqual(opened.call_count, 1)
+
+    def test_it_refetches_once_the_interval_has_elapsed(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "60"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")) as opened:
+            lf.get_config()
+            lf._FETCHED_AT -= 61          # pretend a minute passed
+            lf.get_config()
+        self.assertEqual(opened.call_count, 2)
+
+    def test_a_failed_refresh_keeps_the_config_already_in_use(self):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")):
+            first = lf.get_config()
+        lf._FETCHED_AT -= 3600
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("down")):
+            second = lf.get_config()
+        self.assertIs(second, first)
+        self.assertEqual(second["default_sample_rate"], 80.0)
+
+    def test_a_failing_endpoint_is_not_retried_on_every_invocation(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "3600"
+        with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("down")) as opened:
+            lf.get_config()
+            lf.get_config()
+            lf.get_config()
+        self.assertEqual(opened.call_count, 1)
+
+    def test_the_handler_reports_where_the_config_came_from(self):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG, "etag-1")):
+            with self.assertLogs(level="INFO") as captured:
+                lf.lambda_handler({"invocationId": "x", "records": []})
+        summaries = [json.loads(r.getMessage()) for r in captured.records
+                     if r.getMessage().startswith("{")
+                     and "firehose_sampling_summary" in r.getMessage()]
+        self.assertEqual(summaries[0]["config_source"], "moesif:/v1/config")
+
+
+class TestSamplesEverything(unittest.TestCase):
+    def test_true_only_when_nothing_can_drop(self):
+        self.assertTrue(lf.samples_everything(config()))
+        self.assertFalse(lf.samples_everything(config(default=50)))
+        self.assertFalse(lf.samples_everything(
+            config(rules=[rule("r", 10, [{"path": "a", "value": 1}])])))
+        self.assertFalse(lf.samples_everything(config(user_sample_rate={"u-1": 10.0})))
+        self.assertFalse(lf.samples_everything(config(company_sample_rate={"c-1": 10.0})))
+
+
+
+class TestDebugSetting(unittest.TestCase):
+    """DEBUG switches verbose logging on and off."""
+
+    def tearDown(self):
+        import importlib
+        os.environ.pop("DEBUG", None)
+        importlib.reload(lf)
+
+    def reload_with(self, value):
+        import importlib
+        if value is None:
+            os.environ.pop("DEBUG", None)
+        else:
+            os.environ["DEBUG"] = value
+        return importlib.reload(lf)
+
+    def test_off_by_default(self):
+        import logging
+        self.assertEqual(logging.getLevelName(self.reload_with(None).logger.level), "INFO")
+
+    def test_truthy_values_enable_debug(self):
+        import logging
+        for value in ("true", "True", "TRUE", "1", "yes", "on"):
+            self.assertEqual(logging.getLevelName(self.reload_with(value).logger.level),
+                             "DEBUG", value)
+
+    def test_falsy_and_unusable_values_stay_at_info(self):
+        import logging
+        for value in ("false", "0", "no", "off", "", "   ", "maybe"):
+            self.assertEqual(logging.getLevelName(self.reload_with(value).logger.level),
+                             "INFO", repr(value))
+
+
+
+class TestFetchSettings(DynamicConfigBase):
+    """The tunables that control the call itself."""
+
+    def urlopen_kwargs(self):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG)) as opened:
+            lf.fetch_remote_config()
+        return opened.call_args
+
+    def test_the_default_timeout_is_three_seconds(self):
+        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 3.0)
+
+    def test_the_timeout_is_configurable(self):
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.5"
+        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 0.5)
+
+    def test_an_unusable_timeout_falls_back(self):
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "soon"
+        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 3.0)
+
+    def test_the_refresh_interval_is_configurable(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "300"
+        self.assertEqual(lf._refresh_seconds(), 300.0)
+
+    def test_an_unusable_refresh_interval_falls_back_to_sixty(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "often"
+        self.assertEqual(lf._refresh_seconds(), 60.0)
+
+    def test_a_negative_refresh_interval_is_clamped(self):
+        os.environ["CONFIG_REFRESH_SECONDS"] = "-10"
+        self.assertEqual(lf._refresh_seconds(), 0.0)
+
+    def test_a_response_without_an_etag_keeps_the_previous_one(self):
+        lf._ETAG = "etag-1"
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(MOESIF_CONFIG)):
+            lf.fetch_remote_config()
+        self.assertEqual(lf._ETAG, "etag-1")
+
+
+class TestDynamicConfigEndToEnd(DynamicConfigBase):
+    """A config fetched from Moesif actually samples the batch."""
+
+    def run_batch(self, config_document, bodies):
+        with mock.patch.object(lf.urllib.request, "urlopen",
+                               return_value=FakeResponse(config_document, "etag-1")):
+            return lf.lambda_handler(firehose(*bodies))["records"]
+
+    def test_a_regex_rule_from_moesif_drops_records(self):
+        document = {"sample_rate": 100, "regex_config": [
+            {"sample_rate": 0, "conditions": [{"path": "request.route", "value": "^/health$"}]}]}
+        results = self.run_batch(document, [
+            json.dumps(event(request={"verb": "GET", "uri": "https://api.x.com/health"})),
+            json.dumps(event()),
+        ])
+        self.assertEqual([r["result"] for r in results], ["Dropped", "Ok"])
+
+    def test_a_company_rate_from_moesif_drops_records(self):
+        document = {"sample_rate": 100, "company_sample_rate": {"acme-corp": 0}}
+        results = self.run_batch(document, [
+            json.dumps(event()),                             # acme-corp
+            json.dumps(event(company_id="globex")),
+        ])
+        self.assertEqual([r["result"] for r in results], ["Dropped", "Ok"])
+
+    def test_a_user_rate_from_moesif_stamps_weight(self):
+        document = {"sample_rate": 100, "user_sample_rate": {"u-1": 50}}
+        with mock.patch.object(lf.random, "random", return_value=0.0):   # always keep
+            results = self.run_batch(document, [json.dumps(event(user_id="u-1"))])
+        self.assertEqual(json.loads(body_of(results[0]))["weight"], 2)
+
+    def test_ip_address_is_matchable_like_the_other_fields(self):
+        document = {"sample_rate": 100, "regex_config": [
+            {"sample_rate": 0,
+             "conditions": [{"path": "request.ip_address", "value": "^10\\."}]}]}
+        results = self.run_batch(document, [
+            json.dumps(event(request={"verb": "GET", "uri": "https://api.x.com/v1/items",
+                                      "ip_address": "10.0.0.1"})),
+            json.dumps(event(request={"verb": "GET", "uri": "https://api.x.com/v1/items",
+                                      "ip_address": "203.0.113.5"})),
+        ])
+        self.assertEqual([r["result"] for r in results], ["Dropped", "Ok"])
+
 
 
 if __name__ == "__main__":
