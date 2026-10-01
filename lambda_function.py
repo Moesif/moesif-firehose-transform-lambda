@@ -9,6 +9,8 @@ Rules are fetched from Moesif with MOESIF_APPLICATION_ID. Without them nothing i
 Handler: lambda_function.lambda_handler
 """
 
+__version__ = "1.0.0"
+
 import base64
 import json
 import logging
@@ -411,6 +413,7 @@ def get_config():
         else:
             logger.info("Sampling config loaded from Moesif: default %g%%, %d rule(s)",
                         _CONFIG["default_sample_rate"], len(_CONFIG["rules"]))
+        logger.info("moesif-firehose-transform-lambda %s", __version__)
     elif dynamic_config_enabled() and now - _FETCHED_AT >= _refresh_seconds():
         # Stamp the attempt before making it, so a failing endpoint is retried
         # on the interval rather than on every invocation.
