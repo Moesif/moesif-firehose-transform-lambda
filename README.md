@@ -155,8 +155,10 @@ The summary log line reports the config in use via `config_source`, and
    zip function.zip lambda_function.py
    ```
 2. Create the Lambda with Python 3.12 or later, handler
-   `lambda_function.lambda_handler`, timeout **60 seconds** (the 3-second default
-   is not enough for a full buffer), memory 512 MB.
+   `lambda_function.lambda_handler`, memory 512 MB, and a timeout of **at least
+   30 seconds**. Sampling a full 6 MB buffer takes well under a second, so the
+   timeout mainly needs to cover a config fetch, which `CONFIG_FETCH_TIMEOUT_SECONDS`
+   already caps. Raise it if your buffers are large or you prefer more headroom.
 3. On the delivery stream, enable **Transform source records with AWS Lambda**
    and point it at the function. Buffer hints of 1 MB / 60 s are a reasonable
    starting point.
@@ -195,10 +197,9 @@ Two things to watch:
 
 ## Behaviour and limitations
 
-**Fails open.** An invalid config, an unreadable record, non-JSON content, or an
-unexpected error passes the record through unchanged. The function never returns
-`ProcessingFailed`, which would route records to the delivery stream's error
-output.
+**Fails open.** Anything the function cannot handle passes through unchanged. It
+never returns `ProcessingFailed`, which would route records to the delivery
+stream's error output.
 
 **Batched records.** A record containing newline-delimited JSON or a JSON array is
 sampled per event; the record is marked `Dropped` only when every event inside it
@@ -214,6 +215,12 @@ reporting or billing.
 
 **No governance rules.** This function samples and filters; it does not block or
 transform requests the way an SDK's governance rules can.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
