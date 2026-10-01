@@ -98,42 +98,72 @@ def _refresh_seconds():
         return 60.0
 
 
+def _fetch_timeout():
+    """Total time allowed for a config fetch, retries included."""
+    try:
+        return max(0.1, float(os.environ.get("CONFIG_FETCH_TIMEOUT_SECONDS", 6)))
+    except ValueError:
+        return 6.0
+
+
 def fetch_remote_config():
-    """GET /v1/config. Returns a config, or None to keep the current one."""
-
-    global _ETAG
-
+    """GET /v1/config. Returns a config, or None to keep the current one.
+    Retries until the time budget runs out. Each attempt is given whatever is
+    left of it, so the call can never outlast CONFIG_FETCH_TIMEOUT_SECONDS.
+    """
     app_id = os.environ.get("MOESIF_APPLICATION_ID", "").strip()
     if not app_id:
         return None
 
     url = os.environ.get("MOESIF_BASE_URI", DEFAULT_BASE_URI).rstrip("/") + "/v1/config"
+    deadline = time.monotonic() + _fetch_timeout()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("Giving up on the Moesif config after %d attempt(s); "
+                           "keeping the current config", attempt - 1)
+            return None
+
+        config, retry = _attempt_fetch(url, app_id, remaining)
+        if config is not None or not retry:
+            return config
+
+        # Back off, but never past the deadline.
+        delay = min(0.5 * attempt, max(0.0, deadline - time.monotonic()))
+        if delay:
+            time.sleep(delay)
+
+
+def _attempt_fetch(url, app_id, timeout):
+    """One request. Returns (config or None, whether to try again)."""
+    global _ETAG
+
     headers = {"X-Moesif-Application-Id": app_id,
                "Content-Type": "application/json; charset=utf-8"}
     if _ETAG:
         headers["If-None-Match"] = _ETAG
 
     try:
-        timeout = float(os.environ.get("CONFIG_FETCH_TIMEOUT_SECONDS", 3))
-    except ValueError:
-        timeout = 3.0
-
-    try:
         request = urllib.request.Request(url, headers=headers, method="GET")
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8")
             _ETAG = response.headers.get("X-Moesif-Config-ETag") or _ETAG
-            return _from_moesif_config(json.loads(body))
+            return _from_moesif_config(json.loads(body)), False
     except urllib.error.HTTPError as exc:
         if exc.code == 304:
+            # Not a failure: the config has not changed since the last fetch.
             logger.debug("Moesif config unchanged (304)")
-        elif 401 <= exc.code <= 403:
+            return None, False
+        if 401 <= exc.code <= 403:
             logger.error("Unauthorized fetching Moesif config; check MOESIF_APPLICATION_ID")
         else:
             logger.warning("Moesif config fetch returned status %s", exc.code)
     except Exception as exc:
-        logger.warning("Moesif config fetch failed (%s); keeping the current config", exc)
-    return None
+        logger.warning("Moesif config fetch failed (%s)", exc)
+    return None, True
 
 
 def _from_moesif_config(raw):

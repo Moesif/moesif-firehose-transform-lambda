@@ -225,6 +225,7 @@ class TestKeepEverythingFallback(unittest.TestCase):
     def tearDown(self):
         lf._CONFIG = None
         os.environ.pop("MOESIF_APPLICATION_ID", None)
+        os.environ.pop("CONFIG_FETCH_TIMEOUT_SECONDS", None)
 
     def test_no_application_id_means_no_sampling(self):
         cfg = lf.get_config()
@@ -248,6 +249,8 @@ class TestKeepEverythingFallback(unittest.TestCase):
 
     def test_an_unreachable_moesif_means_no_sampling(self):
         os.environ["MOESIF_APPLICATION_ID"] = "test-app-id"
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.01"
+        os.environ["CONFIG_FETCH_RETRIES"] = "0"   # retries are exercised separately
         with mock.patch.object(lf.urllib.request, "urlopen", side_effect=OSError("down")):
             cfg = lf.get_config()
         self.assertTrue(lf.samples_everything(cfg))
@@ -602,19 +605,34 @@ def http_error(code):
     return lf.urllib.error.HTTPError("http://x", code, "err", {}, None)
 
 
+class FakeClock:
+    """A clock that only advances when the code under test sleeps."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class DynamicConfigBase(unittest.TestCase):
     def setUp(self):
         lf._CONFIG = None
         lf._ETAG = None
         lf._FETCHED_AT = 0.0
         os.environ["MOESIF_APPLICATION_ID"] = "test-app-id"
+        # A tiny budget keeps unrelated tests to a single attempt.
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.01"
 
     def tearDown(self):
         lf._CONFIG = None
         lf._ETAG = None
         lf._FETCHED_AT = 0.0
-        for key in ("MOESIF_APPLICATION_ID", "MOESIF_BASE_URI",
-                    "CONFIG_REFRESH_SECONDS", "CONFIG_FETCH_TIMEOUT_SECONDS"):
+        for key in ("MOESIF_APPLICATION_ID", "MOESIF_BASE_URI", "CONFIG_REFRESH_SECONDS",
+                    "CONFIG_FETCH_TIMEOUT_SECONDS"):
             os.environ.pop(key, None)
 
 
@@ -869,16 +887,21 @@ class TestFetchSettings(DynamicConfigBase):
             lf.fetch_remote_config()
         return opened.call_args
 
-    def test_the_default_timeout_is_three_seconds(self):
-        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 3.0)
+    def test_the_default_budget_is_six_seconds(self):
+        os.environ.pop("CONFIG_FETCH_TIMEOUT_SECONDS", None)
+        self.assertEqual(lf._fetch_timeout(), 6.0)
 
-    def test_the_timeout_is_configurable(self):
+    def test_the_budget_is_configurable(self):
         os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.5"
-        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 0.5)
+        self.assertEqual(lf._fetch_timeout(), 0.5)
 
-    def test_an_unusable_timeout_falls_back(self):
+    def test_an_unusable_budget_falls_back(self):
         os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "soon"
-        self.assertEqual(self.urlopen_kwargs().kwargs["timeout"], 3.0)
+        self.assertEqual(lf._fetch_timeout(), 6.0)
+
+    def test_the_first_attempt_is_given_the_budget(self):
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.5"
+        self.assertAlmostEqual(self.urlopen_kwargs().kwargs["timeout"], 0.5, places=2)
 
     def test_the_refresh_interval_is_configurable(self):
         os.environ["CONFIG_REFRESH_SECONDS"] = "300"
@@ -943,6 +966,74 @@ class TestDynamicConfigEndToEnd(DynamicConfigBase):
         ])
         self.assertEqual([r["result"] for r in results], ["Dropped", "Ok"])
 
+
+
+
+class TestFetchBudget(DynamicConfigBase):
+    """Retries continue until the time budget is spent."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "6"
+
+    def attempts(self, side_effect):
+        """Run a fetch against a clock that only moves when the code backs off."""
+        clock = FakeClock()
+        with mock.patch.object(lf.time, "sleep", clock.sleep), \
+             mock.patch.object(lf.time, "monotonic", clock.monotonic):
+            with mock.patch.object(lf.urllib.request, "urlopen",
+                                   side_effect=side_effect) as opened:
+                result = lf.fetch_remote_config()
+        return opened.call_count, result, clock.now
+
+    def test_failures_are_retried_until_the_budget_runs_out(self):
+        count, result, elapsed = self.attempts(TimeoutError("read timed out"))
+        self.assertGreater(count, 1)
+        self.assertIsNone(result)
+        self.assertLessEqual(elapsed, 6.0)
+
+    def test_every_failure_kind_is_retried(self):
+        for side_effect in (TimeoutError("slow"), OSError("refused"),
+                            http_error(401), http_error(404), http_error(503)):
+            count, _, _ = self.attempts(side_effect)
+            self.assertGreater(count, 1, repr(side_effect))
+
+    def test_it_stops_as_soon_as_one_attempt_succeeds(self):
+        count, result, _ = self.attempts(
+            [TimeoutError("slow"), FakeResponse(MOESIF_CONFIG, "etag-1")])
+        self.assertEqual(count, 2)
+        self.assertEqual(result["default_sample_rate"], 80.0)
+
+    def test_304_is_not_retried(self):
+        # An unchanged config is a success, not a failure.
+        count, _, _ = self.attempts(http_error(304))
+        self.assertEqual(count, 1)
+
+    def test_each_attempt_gets_only_the_time_that_is_left(self):
+        timeouts = []
+        clock = FakeClock()
+
+        def record(request, timeout=None):
+            timeouts.append(timeout)
+            raise TimeoutError("slow")
+
+        with mock.patch.object(lf.time, "sleep", clock.sleep), \
+             mock.patch.object(lf.time, "monotonic", clock.monotonic):
+            with mock.patch.object(lf.urllib.request, "urlopen", side_effect=record):
+                lf.fetch_remote_config()
+
+        self.assertEqual(timeouts, sorted(timeouts, reverse=True))  # shrinking
+        self.assertLessEqual(timeouts[0], 6.0)
+        self.assertGreater(timeouts[-1], 0)
+
+    def test_a_small_budget_allows_one_attempt(self):
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "0.01"
+        count, _, _ = self.attempts(TimeoutError("slow"))
+        self.assertEqual(count, 1)
+
+    def test_an_unusable_budget_falls_back_to_six(self):
+        os.environ["CONFIG_FETCH_TIMEOUT_SECONDS"] = "soon"
+        self.assertEqual(lf._fetch_timeout(), 6.0)
 
 
 if __name__ == "__main__":

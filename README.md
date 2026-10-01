@@ -116,7 +116,7 @@ Every setting is an environment variable. Nothing is hardcoded.
 | `MOESIF_APPLICATION_ID` | none | set it to enable sampling |
 | `MOESIF_BASE_URI` | `https://api.moesif.net` | override for another region or a proxy |
 | `CONFIG_REFRESH_SECONDS` | `60` | how often to re-check while warm |
-| `CONFIG_FETCH_TIMEOUT_SECONDS` | `3` | how long to wait for Moesif |
+| `CONFIG_FETCH_TIMEOUT_SECONDS` | `6` | total time allowed for a fetch, retries included |
 | `DEBUG` | off | set to `true` for verbose logging |
 
 ### How refresh works
@@ -128,6 +128,10 @@ unchanged config costs a `304` and no body.
 
 With high Firehose concurrency, each warm instance refreshes independently, so
 raise the interval if many instances run at once.
+
+A failed fetch is retried with a short backoff until
+`CONFIG_FETCH_TIMEOUT_SECONDS` is spent. Each attempt is given whatever is left
+of that budget, so a fetch never delays a batch for longer than it allows.
 
 ### When there are no rules
 
