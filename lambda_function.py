@@ -20,14 +20,27 @@ import time
 import urllib.error
 import urllib.request
 
+# --- settings -----------------------------------------------------------------
+# Defaults for the environment variables named beside them.
+# MOESIF_APPLICATION_ID has no default: without it no config is fetched and nothing is sampled.
+
+DEFAULT_BASE_URI = "https://api.moesif.net"   # MOESIF_BASE_URI
+DEFAULT_REFRESH_SECONDS = 60.0                # CONFIG_REFRESH_SECONDS
+DEFAULT_FETCH_TIMEOUT_SECONDS = 6.0           # CONFIG_FETCH_TIMEOUT_SECONDS
+
+# Fixed constants, not configurable.
+DEFAULT_SAMPLE_RATE = 100.0         # the rate when Moesif supplies no rules
+CONFIG_PATH = "/v1/config"          # appended to the base URI
+TRUTHY = ("1", "true", "yes", "on") # values that turn DEBUG on
+RETRY_BACKOFF_SECONDS = 0.5         # multiplied by the attempt number
+MIN_FETCH_TIMEOUT_SECONDS = 0.1     # floor for a configured fetch budget
+
+
 logger = logging.getLogger()
-# DEBUG turns on verbose logging.
-DEBUG = os.environ.get("DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+DEBUG = os.environ.get("DEBUG", "").strip().lower() in TRUTHY
 logger.setLevel(logging.DEBUG if DEBUG else logging.INFO)
 
 MISSING = object()  # Distinguishes an absent field from a JSON null
-
-DEFAULT_BASE_URI = "https://api.moesif.net"
 
 _CONFIG = None      # the config in use
 _ETAG = None        # ETag of the last config fetched from Moesif
@@ -38,7 +51,7 @@ _FETCHED_AT = 0.0   # monotonic time of the last fetch attempt
 
 def keep_everything(reason):
     """The config used when Moesif has not supplied one: sample nothing."""
-    return {"default_sample_rate": 100.0, "rules": [], "user_sample_rate": {},
+    return {"default_sample_rate": DEFAULT_SAMPLE_RATE, "rules": [], "user_sample_rate": {},
             "company_sample_rate": {}, "source": reason, "valid": False}
 
 
@@ -93,17 +106,20 @@ def dynamic_config_enabled():
 
 def _refresh_seconds():
     try:
-        return max(0.0, float(os.environ.get("CONFIG_REFRESH_SECONDS", 60)))
+        return max(0.0, float(os.environ.get("CONFIG_REFRESH_SECONDS",
+                                             DEFAULT_REFRESH_SECONDS)))
     except ValueError:
-        return 60.0
+        return DEFAULT_REFRESH_SECONDS
 
 
 def _fetch_timeout():
     """Total time allowed for a config fetch, retries included."""
     try:
-        return max(0.1, float(os.environ.get("CONFIG_FETCH_TIMEOUT_SECONDS", 6)))
+        return max(MIN_FETCH_TIMEOUT_SECONDS,
+                   float(os.environ.get("CONFIG_FETCH_TIMEOUT_SECONDS",
+                                        DEFAULT_FETCH_TIMEOUT_SECONDS)))
     except ValueError:
-        return 6.0
+        return DEFAULT_FETCH_TIMEOUT_SECONDS
 
 
 def fetch_remote_config():
@@ -115,7 +131,7 @@ def fetch_remote_config():
     if not app_id:
         return None
 
-    url = os.environ.get("MOESIF_BASE_URI", DEFAULT_BASE_URI).rstrip("/") + "/v1/config"
+    url = os.environ.get("MOESIF_BASE_URI", DEFAULT_BASE_URI).rstrip("/") + CONFIG_PATH
     deadline = time.monotonic() + _fetch_timeout()
     attempt = 0
 
@@ -132,7 +148,8 @@ def fetch_remote_config():
             return config
 
         # Back off, but never past the deadline.
-        delay = min(0.5 * attempt, max(0.0, deadline - time.monotonic()))
+        delay = min(RETRY_BACKOFF_SECONDS * attempt,
+                    max(0.0, deadline - time.monotonic()))
         if delay:
             time.sleep(delay)
 
@@ -184,11 +201,11 @@ def _from_moesif_config(raw):
             logger.warning("Skipping regex_config[%d] from Moesif: %s", index, exc)
 
     return {
-        "default_sample_rate": _rate(raw.get("sample_rate", 100)),
+        "default_sample_rate": _rate(raw.get("sample_rate", DEFAULT_SAMPLE_RATE)),
         "rules": rules,
         "user_sample_rate": _rate_map(raw.get("user_sample_rate")),
         "company_sample_rate": _rate_map(raw.get("company_sample_rate")),
-        "source": "moesif:/v1/config",
+        "source": "moesif:" + CONFIG_PATH,
         "valid": True,
     }
 
