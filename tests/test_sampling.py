@@ -145,6 +145,23 @@ class TestKeepDropWeight(unittest.TestCase):
         lf.stamp_weight(payload, 100)
         self.assertEqual(payload["weight"], 1)
 
+    def test_an_unusable_existing_weight_is_replaced(self):
+        for junk in ("lots", 0, -5, True, False, None, {"a": 1}):
+            payload = event(weight=junk)
+            lf.stamp_weight(payload, 100)
+            self.assertEqual(payload["weight"], 1, repr(junk))
+
+    def test_an_unusable_existing_weight_is_replaced_at_a_sampled_rate(self):
+        for junk in ("lots", True, None):
+            payload = event(weight=junk)
+            lf.stamp_weight(payload, 50)
+            self.assertEqual(payload["weight"], 2, repr(junk))
+
+    def test_a_correct_weight_is_left_alone(self):
+        payload = event(weight=2)
+        self.assertFalse(lf.stamp_weight(payload, 50))
+        self.assertEqual(payload["weight"], 2)
+
     def test_weighted_survivors_reconstruct_volume(self):
         random.seed(7)
         cfg = config([rule("tenth", 10, [{"path": "company_id", "value": "acme-corp"}])])
@@ -953,6 +970,28 @@ class TestDynamicConfigEndToEnd(DynamicConfigBase):
         with mock.patch.object(lf.random, "random", return_value=0.0):   # always keep
             results = self.run_batch(document, [json.dumps(event(user_id="u-1"))])
         self.assertEqual(json.loads(body_of(results[0]))["weight"], 2)
+
+    def test_a_company_rate_from_moesif_stamps_weight(self):
+        document = {"sample_rate": 100, "company_sample_rate": {"acme-corp": 25}}
+        with mock.patch.object(lf.random, "random", return_value=0.0):
+            results = self.run_batch(document, [json.dumps(event())])
+        self.assertEqual(json.loads(body_of(results[0]))["weight"], 4)
+
+    def test_a_regex_rule_from_moesif_stamps_weight(self):
+        document = {"sample_rate": 100, "regex_config": [
+            {"sample_rate": 10, "conditions": [{"path": "request.verb", "value": "^GET$"}]}]}
+        with mock.patch.object(lf.random, "random", return_value=0.0):
+            results = self.run_batch(document, [json.dumps(event())])
+        self.assertEqual(json.loads(body_of(results[0]))["weight"], 10)
+
+    def test_every_event_in_a_batched_record_is_weighted(self):
+        document = {"sample_rate": 100, "company_sample_rate": {"acme-corp": 50}}
+        batched = "\n".join(json.dumps(event()) for _ in range(3))
+        with mock.patch.object(lf.random, "random", return_value=0.0):
+            results = self.run_batch(document, [batched])
+        weights = [json.loads(line)["weight"]
+                   for line in body_of(results[0]).strip().split("\n")]
+        self.assertEqual(weights, [2, 2, 2])
 
     def test_ip_address_is_matchable_like_the_other_fields(self):
         document = {"sample_rate": 100, "regex_config": [

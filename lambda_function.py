@@ -371,10 +371,13 @@ def stamp_weight(event, sample_rate):
     """Set the event's weight. Returns True if the event was modified."""
     weight = weight_for(sample_rate)
     existing = event.get("weight")
-    if weight == existing:
+    # A boolean is not a usable weight, whatever Python says about 1 == True.
+    usable = isinstance(existing, (int, float)) and not isinstance(existing, bool)
+
+    if usable and existing == weight:
         return False
-    # Moesif treats an absent weight as 1, so writing it adds payload for nothing.
-    if weight == 1 and existing is None:
+    # Moesif reads an absent weight as 1, so writing it adds payload for nothing.
+    if weight == 1 and "weight" not in event:
         return False
     event["weight"] = weight
     return True
