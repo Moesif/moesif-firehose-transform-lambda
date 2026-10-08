@@ -10,8 +10,10 @@ way. **This function is that opportunity.** It runs inside the delivery stream,
 sees every event before Moesif does, and can act on each one.
 
 ```
-your API ──▶ Firehose ──▶ [ transform Lambda ] ──▶ Moesif
+your API/AWS API Gateway ──▶ AWS Firehose ──▶ [ AWS transform Lambda ] ──▶ Moesif
 ```
+
+Works whether or not API Gateway is in front of the stream.
 
 Your integration does not change. The delivery stream, its destination and your
 producers stay exactly as they are. Firehose simply invokes this function on
@@ -107,36 +109,11 @@ Within `regex_config`, rules are evaluated in order and the first whose
 conditions all match wins. Put rules that protect traffic (`sample_rate: 100`)
 and rules that remove it (`sample_rate: 0`) before the rules that sample.
 
-### Record formats
+### Works with either stream
 
-Rules are written in Moesif's vocabulary (`request.verb`, `response.status`,
-`company_id` and so on), because that is the shape events have once they reach
-Moesif. A delivery stream may carry a different shape that Moesif converts on
-arrival, so the function looks for each rule path under the names other formats
-use:
-
-| rule path | also looked up as |
-|---|---|
-| `request.verb` | `httpMethod` |
-| `request.route` | derived from `request.uri`, or `resourcePath` |
-| `request.uri` | `resourcePath` |
-| `request.ip_address` | `ip` |
-| `response.status` | `status` |
-| `user_id` | `user`, `apiKeyId`, `principalId`, `cognitoIdentityId`, `caller` |
-| `company_id` | `companyId` |
-
-The path as written always wins; the alternatives are tried only when it is
-absent, and only on records carrying every field the API Gateway format requires
-(`apiId`, `requestId`, `requestTime`, `protocol`, `httpMethod`, `resourcePath`,
-`requestHostHeader`, `requestUserAgentHeader`, `status`, `responseLength`,
-`durationMs`). A stream of some other shape is never reinterpreted, even if it
-happens to use a name like `status` or `user` for something unrelated.
-
-Set `RECORD_FORMAT` to `apigateway` or `moesif` to skip the check when a stream's
-shape is known in advance. The default, `auto`, detects it per record.
-
-So the same rule works whether the stream carries Moesif event models or API
-Gateway access logs, and a rule may also name any other field a record contains.
+Some delivery streams carry API Gateway access logs; others carry Moesif event
+models. Rules are written the same way for both, and the function works out
+which it is receiving. Nothing to configure.
 
 ### Settings
 
@@ -148,7 +125,6 @@ Every setting is an environment variable. Nothing is hardcoded.
 | `MOESIF_BASE_URI` | `https://api.moesif.net` | override for another region or a proxy |
 | `CONFIG_REFRESH_SECONDS` | `60` | how often to re-check while warm |
 | `CONFIG_FETCH_TIMEOUT_SECONDS` | `6` | total time allowed for a fetch, retries included |
-| `RECORD_FORMAT` | `auto` | `apigateway` or `moesif` to skip format detection |
 | `DEBUG` | off | set to `true` for verbose logging |
 
 ### How refresh works

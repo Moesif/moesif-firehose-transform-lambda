@@ -314,11 +314,6 @@ DERIVED = {"request.route": _route}
 
 def is_api_gateway_record(event):
     """Whether the API Gateway field names should be consulted for this record."""
-    declared = os.environ.get("RECORD_FORMAT", "auto").strip().lower()
-    if declared == "apigateway":
-        return True
-    if declared == "moesif":
-        return False
     return all(get_path(event, marker) is not MISSING for marker in API_GATEWAY_MARKERS)
 
 

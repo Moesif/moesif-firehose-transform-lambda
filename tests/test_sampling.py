@@ -1202,29 +1202,6 @@ class TestFallbackSafety(unittest.TestCase):
             del record[missing]
             self.assertFalse(lf.is_api_gateway_record(record), missing)
 
-    def test_record_format_can_be_declared(self):
-        try:
-            os.environ["RECORD_FORMAT"] = "moesif"
-            self.assertFalse(lf.is_api_gateway_record(api_gateway_record()))
-            self.assertIs(lf.resolve_field(api_gateway_record(), "company_id"), lf.MISSING)
-
-            os.environ["RECORD_FORMAT"] = "apigateway"
-            self.assertTrue(lf.is_api_gateway_record(self.COLLIDING))
-
-            os.environ["RECORD_FORMAT"] = "auto"
-            self.assertTrue(lf.is_api_gateway_record(api_gateway_record()))
-            self.assertFalse(lf.is_api_gateway_record(self.COLLIDING))
-        finally:
-            os.environ.pop("RECORD_FORMAT", None)
-
-    def test_an_unknown_record_format_falls_back_to_detection(self):
-        try:
-            os.environ["RECORD_FORMAT"] = "nonsense"
-            self.assertTrue(lf.is_api_gateway_record(api_gateway_record()))
-            self.assertFalse(lf.is_api_gateway_record(self.COLLIDING))
-        finally:
-            os.environ.pop("RECORD_FORMAT", None)
-
     def test_a_real_api_gateway_record_passes_the_gate(self):
         self.assertTrue(lf.is_api_gateway_record(api_gateway_record()))
 
@@ -1333,7 +1310,6 @@ class RecordFormatCase(unittest.TestCase):
 
     def tearDown(self):
         lf._CONFIG = None
-        os.environ.pop("RECORD_FORMAT", None)
 
     def make(self, **kwargs):
         raise NotImplementedError
@@ -1433,10 +1409,6 @@ class TestApiGatewayFormatSampling(RecordFormatCase):
 
     def test_unmatched_traffic_gets_the_default(self):
         self.assertEqual(self.rate(), (100.0, None))
-
-    def test_declaring_the_format_as_moesif_disables_translation(self):
-        os.environ["RECORD_FORMAT"] = "moesif"
-        self.assertEqual(self.rate(company="noisy-co"), (100.0, None))
 
     def test_sampling_runs_end_to_end(self):
         random.seed(5)
