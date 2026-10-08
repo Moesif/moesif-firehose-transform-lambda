@@ -13,7 +13,8 @@ sees every event before Moesif does, and can act on each one.
 your API/AWS API Gateway ──▶ AWS Firehose ──▶ [ AWS transform Lambda ] ──▶ Moesif
 ```
 
-Works whether or not API Gateway is in front of the stream.
+Both setups are supported: API Gateway writing access logs to the stream, or your
+own producer sending Moesif events to it.
 
 Your integration does not change. The delivery stream, its destination and your
 producers stay exactly as they are. Firehose simply invokes this function on

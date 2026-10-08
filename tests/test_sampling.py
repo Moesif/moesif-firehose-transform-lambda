@@ -1079,7 +1079,7 @@ class TestFetchBudget(DynamicConfigBase):
 def api_gateway_record(**overrides):
     """An API Gateway access log record, the shape /v1/partners/aws/kinesis carries."""
     record = {
-        "apiId": "t9hqyk28mj",
+        "apiId": "test-api-id",
         "companyId": "company-uuid",
         "durationMs": "299",
         "httpMethod": "GET",
@@ -1164,7 +1164,7 @@ class TestFieldFallbacks(unittest.TestCase):
     def test_custom_record_fields_remain_addressable(self):
         record = api_gateway_record()
         self.assertEqual(lf.resolve_field(record, "metadata.subscriptionId"), "sub-uuid")
-        self.assertEqual(lf.resolve_field(record, "apiId"), "t9hqyk28mj")
+        self.assertEqual(lf.resolve_field(record, "apiId"), "test-api-id")
 
 
 class TestFallbackSafety(unittest.TestCase):
