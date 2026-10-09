@@ -3,6 +3,16 @@
 All notable changes to this project are documented here. This project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-09
+
+### Added
+
+- Sampling rules now resolve against API Gateway access log records as well as
+  Moesif event models. Rules are written once in Moesif's vocabulary and the
+  function works out which format a stream carries, per record.
+
+[1.1.0]: https://github.com/Moesif/moesif-firehose-transform-lambda/releases/tag/v1.1.0
+
 ## [1.0.0] - 2026-10-01
 
 First release.

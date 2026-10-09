@@ -9,7 +9,7 @@ Rules are fetched from Moesif with MOESIF_APPLICATION_ID. Without them nothing i
 Handler: lambda_function.lambda_handler
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import base64
 import json
