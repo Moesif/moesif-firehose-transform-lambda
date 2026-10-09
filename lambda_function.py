@@ -9,7 +9,7 @@ Rules are fetched from Moesif with MOESIF_APPLICATION_ID. Without them nothing i
 Handler: lambda_function.lambda_handler
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import base64
 import json
@@ -309,13 +309,39 @@ def _route(event):
 
 
 # Paths computed from the event rather than read off it.
+# These hold for any record that carries the field they are computed from.
 DERIVED = {"request.route": _route}
+
+def is_api_gateway_record(event):
+    """Whether the API Gateway field names should be consulted for this record."""
+    return all(get_path(event, marker) is not MISSING for marker in API_GATEWAY_MARKERS)
+
+
+def resolve_field(event, path):
+    """A rule path's value, however the record happens to spell it."""
+    value = get_path(event, path)
+    if value is not MISSING:
+        return value
+
+    compute = DERIVED.get(path)
+    if compute is not None:
+        value = compute(event)
+        if value is not MISSING:
+            return value
+
+    if not is_api_gateway_record(event):
+        return MISSING
+    for name in API_GATEWAY_FIELDS.get(path, ()):
+        value = get_path(event, name)
+        # API Gateway writes "-" for a context variable it has no value for, and
+        # Moesif skips those. Treat them as absent so both resolve the same field.
+        if value is not MISSING and value is not None and value not in ("", "-"):
+            return value
+    return MISSING
 
 
 def _matches(condition, event):
-    actual = get_path(event, condition["path"])
-    if actual is MISSING and condition["path"] in DERIVED:
-        actual = DERIVED[condition["path"]](event)
+    actual = resolve_field(event, condition["path"])
     present = actual is not MISSING and actual is not None
     if condition["operator"] == "exists":
         return present
@@ -337,13 +363,13 @@ def resolve_rate(event, config):
 
     user_rates = config.get("user_sample_rate") or {}
     if user_rates:
-        user_id = get_path(event, "user_id")
+        user_id = resolve_field(event, "user_id")
         if isinstance(user_id, str) and user_id in user_rates:
             return user_rates[user_id], "user:" + user_id
 
     company_rates = config.get("company_sample_rate") or {}
     if company_rates:
-        company_id = get_path(event, "company_id")
+        company_id = resolve_field(event, "company_id")
         if isinstance(company_id, str) and company_id in company_rates:
             return company_rates[company_id], "company:" + company_id
 
@@ -532,3 +558,22 @@ def _join(kept, kind, trailing_newline):
 
 def _passthrough(record):
     return {"recordId": record.get("recordId"), "result": "Ok", "data": record.get("data")}
+
+
+# --- API Gateway records ------------------------------------------------------
+# Mapping of where each Moesif rule path lives in an API Gateway record.
+API_GATEWAY_FIELDS = {
+    "request.verb":       ("httpMethod",),
+    "request.route":      ("resourcePath",),
+    "request.uri":        ("resourcePath",),
+    "request.ip_address": ("ip",),
+    "response.status":    ("status",),
+    "user_id":            ("user", "apiKeyId", "principalId",
+                           "cognitoIdentityId", "caller"),
+    "company_id":         ("companyId",),
+}
+
+# Fields that identify a record as API Gateway's; all must be present.
+API_GATEWAY_MARKERS = ("apiId", "requestId", "requestTime", "protocol", "httpMethod",
+                       "resourcePath", "requestHostHeader", "requestUserAgentHeader",
+                       "status", "responseLength", "durationMs")

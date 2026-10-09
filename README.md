@@ -10,8 +10,11 @@ way. **This function is that opportunity.** It runs inside the delivery stream,
 sees every event before Moesif does, and can act on each one.
 
 ```
-your API ──▶ Firehose ──▶ [ transform Lambda ] ──▶ Moesif
+your API/AWS API Gateway ──▶ AWS Firehose ──▶ [ AWS transform Lambda ] ──▶ Moesif
 ```
+
+Both setups are supported: API Gateway writing access logs to the stream, or your
+own producer sending Moesif events to it.
 
 Your integration does not change. The delivery stream, its destination and your
 producers stay exactly as they are. Firehose simply invokes this function on
@@ -106,6 +109,12 @@ regex_config  ->  user_sample_rate  ->  company_sample_rate  ->  sample_rate
 Within `regex_config`, rules are evaluated in order and the first whose
 conditions all match wins. Put rules that protect traffic (`sample_rate: 100`)
 and rules that remove it (`sample_rate: 0`) before the rules that sample.
+
+### Works with either stream
+
+Some delivery streams carry API Gateway access logs; others carry Moesif event
+models. Rules are written the same way for both, and the function works out
+which it is receiving. Nothing to configure.
 
 ### Settings
 

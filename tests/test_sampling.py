@@ -1075,5 +1075,374 @@ class TestFetchBudget(DynamicConfigBase):
         self.assertEqual(lf._fetch_timeout(), 6.0)
 
 
+
+def api_gateway_record(**overrides):
+    """An API Gateway access log record, the shape /v1/partners/aws/kinesis carries."""
+    record = {
+        "apiId": "test-api-id",
+        "companyId": "company-uuid",
+        "durationMs": "299",
+        "httpMethod": "GET",
+        "ip": "195.145.170.201",
+        "metadata": {"stage": "prod", "subscriptionId": "sub-uuid"},
+        "principalId": "client-id@clients",
+        "protocol": "HTTP/1.1",
+        "requestHostHeader": "api.example.com",
+        "requestId": "req-uuid",
+        "requestTime": "07/Oct/2026:08:21:45 +0000",
+        "requestUserAgentHeader": "got",
+        "resourcePath": "/v1/orders/42",
+        "responseLength": "253",
+        "status": "200",
+    }
+    record.update(overrides)
+    return record
+
+
+class TestFieldFallbacks(unittest.TestCase):
+    """Rules are written in Moesif's vocabulary; records may use other names."""
+
+    def test_every_rule_path_resolves_on_an_api_gateway_record(self):
+        record = api_gateway_record()
+        self.assertEqual(lf.resolve_field(record, "request.verb"), "GET")
+        self.assertEqual(lf.resolve_field(record, "request.route"), "/v1/orders/42")
+        self.assertEqual(lf.resolve_field(record, "response.status"), "200")
+        self.assertEqual(lf.resolve_field(record, "request.ip_address"), "195.145.170.201")
+        self.assertEqual(lf.resolve_field(record, "user_id"), "client-id@clients")
+        self.assertEqual(lf.resolve_field(record, "company_id"), "company-uuid")
+
+    def test_a_moesif_event_model_is_unaffected(self):
+        self.assertEqual(lf.resolve_field(event(), "request.verb"), "GET")
+        self.assertEqual(lf.resolve_field(event(), "response.status"), 200)
+        self.assertEqual(lf.resolve_field(event(), "company_id"), "acme-corp")
+
+    def test_the_path_as_written_wins_over_a_fallback(self):
+        record = api_gateway_record(httpMethod="GET")
+        record["request"] = {"verb": "POST"}
+        self.assertEqual(lf.resolve_field(record, "request.verb"), "POST")
+
+    def test_user_id_follows_the_collector_resolution_order(self):
+        self.assertEqual(lf.resolve_field(api_gateway_record(user="u"), "user_id"), "u")
+        self.assertEqual(
+            lf.resolve_field(api_gateway_record(apiKeyId="k"), "user_id"), "k")
+        self.assertEqual(lf.resolve_field(api_gateway_record(), "user_id"), "client-id@clients")
+        bare = api_gateway_record()
+        del bare["principalId"]
+        bare["caller"] = "c"
+        self.assertEqual(lf.resolve_field(bare, "user_id"), "c")
+
+    def test_api_gateway_placeholders_are_treated_as_absent(self):
+        record = api_gateway_record(user="-", apiKeyId="", cognitoIdentityId="-",
+                                    principalId="real-client@clients")
+        self.assertEqual(lf.resolve_field(record, "user_id"), "real-client@clients")
+
+    def test_the_chain_continues_past_every_placeholder(self):
+        record = api_gateway_record(user="-", apiKeyId="-", principalId="-",
+                                    cognitoIdentityId="-", caller="real-caller")
+        self.assertEqual(lf.resolve_field(record, "user_id"), "real-caller")
+
+    def test_an_all_placeholder_chain_resolves_to_nothing(self):
+        record = api_gateway_record(user="-", apiKeyId="-", principalId="-",
+                                    cognitoIdentityId="-", caller="-")
+        self.assertIs(lf.resolve_field(record, "user_id"), lf.MISSING)
+
+    def test_a_placeholder_company_is_not_used(self):
+        self.assertIs(lf.resolve_field(api_gateway_record(companyId="-"), "company_id"),
+                      lf.MISSING)
+
+    def test_an_absent_field_still_resolves_to_nothing(self):
+        bare = api_gateway_record()
+        del bare["companyId"]
+        self.assertIs(lf.resolve_field(bare, "company_id"), lf.MISSING)
+
+    def test_a_status_string_compares_numerically(self):
+        condition = lf._parse_condition(
+            {"path": "response.status", "operator": "between", "value": [200, 299]})
+        self.assertTrue(lf._matches(condition, api_gateway_record()))
+        self.assertFalse(lf._matches(condition, api_gateway_record(status="500")))
+
+    def test_custom_record_fields_remain_addressable(self):
+        record = api_gateway_record()
+        self.assertEqual(lf.resolve_field(record, "metadata.subscriptionId"), "sub-uuid")
+        self.assertEqual(lf.resolve_field(record, "apiId"), "test-api-id")
+
+
+class TestFallbackSafety(unittest.TestCase):
+    """Translations apply only to records that really are API Gateway records."""
+
+    COLLIDING = {"status": "200", "ip": "10.0.0.1", "user": "node-7",
+                 "companyId": "not-a-customer", "httpMethod": "GET"}
+
+    def test_a_record_of_another_shape_is_left_alone(self):
+        # Five field names collide, but apiId and resourcePath are absent.
+        for path in ("request.verb", "response.status", "request.ip_address",
+                     "user_id", "company_id"):
+            self.assertIs(lf.resolve_field(self.COLLIDING, path), lf.MISSING, path)
+
+    def test_such_a_record_matches_no_rule(self):
+        cfg = lf._from_moesif_config({
+            "sample_rate": 100,
+            "company_sample_rate": {"not-a-customer": 0},
+            "regex_config": [{"sample_rate": 0,
+                              "conditions": [{"path": "response.status", "value": "^2"}]}]})
+        rate, rule = lf.resolve_rate(self.COLLIDING, cfg)
+        self.assertEqual((rate, rule), (100.0, None))
+
+    def test_all_three_markers_are_required(self):
+        for missing in lf.API_GATEWAY_MARKERS:
+            record = api_gateway_record()
+            del record[missing]
+            self.assertFalse(lf.is_api_gateway_record(record), missing)
+            self.assertIs(lf.resolve_field(record, "company_id"), lf.MISSING, missing)
+
+    def test_a_partial_api_gateway_record_is_not_translated(self):
+        # Moesif rejects a record missing any required field, so neither should we.
+        for missing in lf.API_GATEWAY_MARKERS:
+            record = api_gateway_record()
+            del record[missing]
+            self.assertFalse(lf.is_api_gateway_record(record), missing)
+
+    def test_a_real_api_gateway_record_passes_the_gate(self):
+        self.assertTrue(lf.is_api_gateway_record(api_gateway_record()))
+
+    def test_an_event_model_carrying_colliding_names_is_not_reinterpreted(self):
+        # A stream on the events endpoint whose records happen to use names the
+        # API Gateway translation looks for. None of them must be consulted.
+        record = dict(event(), **{"user": "batch-runner", "status": "ok",
+                                  "ip": "10.0.0.5", "companyId": "WRONG-COMPANY",
+                                  "httpMethod": "DELETE"})
+        self.assertEqual(lf.resolve_field(record, "request.verb"), "GET")
+        self.assertEqual(lf.resolve_field(record, "response.status"), 200)
+        self.assertEqual(lf.resolve_field(record, "company_id"), "acme-corp")
+        self.assertIs(lf.resolve_field(record, "user_id"), lf.MISSING)
+
+    def test_a_config_targeting_those_colliding_values_matches_nothing(self):
+        record = dict(event(), **{"user": "batch-runner", "companyId": "WRONG-COMPANY",
+                                  "httpMethod": "DELETE"})
+        cfg = lf._from_moesif_config({
+            "sample_rate": 100,
+            "user_sample_rate": {"batch-runner": 0},
+            "company_sample_rate": {"WRONG-COMPANY": 0},
+            "regex_config": [{"sample_rate": 0,
+                              "conditions": [{"path": "request.verb", "value": "^DELETE$"}]}]})
+        self.assertEqual(lf.resolve_rate(record, cfg), (100.0, None))
+
+    def test_a_moesif_event_model_does_not_need_the_gate(self):
+        self.assertFalse(lf.is_api_gateway_record(event()))
+        self.assertEqual(lf.resolve_field(event(), "request.verb"), "GET")
+
+
+class TestApiGatewaySampling(unittest.TestCase):
+    """A Moesif config applied to API Gateway records, end to end."""
+
+    NOISY = "company-uuid"
+
+    def setUp(self):
+        lf._CONFIG = lf._from_moesif_config({
+            "sample_rate": 100,
+            "company_sample_rate": {self.NOISY: 10},
+            "regex_config": [
+                {"sample_rate": 100,
+                 "conditions": [{"path": "response.status", "value": "^(4|5)"}]},
+                {"sample_rate": 100,
+                 "conditions": [{"path": "request.verb", "value": "^(POST|PUT|DELETE)$"}]},
+            ]})
+
+    def tearDown(self):
+        lf._CONFIG = None
+
+    def rate_for(self, **overrides):
+        return lf.resolve_rate(api_gateway_record(**overrides), lf._CONFIG)
+
+    def test_the_noisy_company_is_sampled(self):
+        self.assertEqual(self.rate_for()[0], 10.0)
+
+    def test_errors_are_protected(self):
+        self.assertEqual(self.rate_for(status="500")[0], 100.0)
+        self.assertEqual(self.rate_for(status="404")[0], 100.0)
+
+    def test_writes_are_protected(self):
+        for verb in ("POST", "PUT", "DELETE"):
+            self.assertEqual(self.rate_for(httpMethod=verb)[0], 100.0, verb)
+
+    def test_other_companies_are_untouched(self):
+        self.assertEqual(self.rate_for(companyId="someone-else")[0], 100.0)
+
+    def test_sampled_records_carry_weight(self):
+        with mock.patch.object(lf.random, "random", return_value=0.0):
+            out = lf.lambda_handler(firehose(json.dumps(api_gateway_record())))["records"]
+        self.assertEqual(json.loads(body_of(out[0]))["weight"], 10)
+
+
+
+def keep_from(traffic):
+    """Run a list of records through the handler and return those kept."""
+    payload = {"invocationId": "fmt", "records": [
+        {"recordId": "r%d" % i, "data": base64.b64encode(json.dumps(e).encode()).decode()}
+        for i, e in enumerate(traffic)]}
+    results = lf.lambda_handler(payload)["records"]
+    return [json.loads(base64.b64decode(r["data"]))
+            for r in results if r["result"] == "Ok"]
+
+
+def count(records, predicate):
+    return sum(1 for r in records if predicate(r))
+
+
+
+# One config, written once in Moesif's vocabulary, used by both suites below.
+SHARED_CONFIG = {
+    "sample_rate": 100,
+    "company_sample_rate": {"noisy-co": 10},
+    "user_sample_rate": {"heavy-user": 50},
+    "regex_config": [
+        {"sample_rate": 100, "conditions": [{"path": "response.status", "value": "^(4|5)"}]},
+        {"sample_rate": 0, "conditions": [{"path": "request.route", "value": "^/health$"}]},
+    ],
+}
+
+
+class RecordFormatCase(unittest.TestCase):
+    """Shared assertions. Subclasses supply records in one format or the other."""
+
+    def setUp(self):
+        lf._CONFIG = lf._from_moesif_config(SHARED_CONFIG)
+
+    def tearDown(self):
+        lf._CONFIG = None
+
+    def make(self, **kwargs):
+        raise NotImplementedError
+
+    def rate(self, **kwargs):
+        return lf.resolve_rate(self.make(**kwargs), lf._CONFIG)
+
+
+class TestMoesifFormatSampling(RecordFormatCase):
+    """A stream of Moesif event models samples on Moesif's own fields only."""
+
+    def make(self, company="quiet-co", user="someone", verb="GET", status=200,
+             route="/v1/orders"):
+        return {"request": {"verb": verb, "uri": "https://api.example.com" + route},
+                "response": {"status": status},
+                "user_id": user, "company_id": company}
+
+    def test_the_record_is_not_seen_as_api_gateway(self):
+        self.assertFalse(lf.is_api_gateway_record(self.make()))
+
+    def test_company_rule_applies(self):
+        self.assertEqual(self.rate(company="noisy-co"), (10.0, "company:noisy-co"))
+
+    def test_user_rule_applies(self):
+        self.assertEqual(self.rate(user="heavy-user")[0], 50.0)
+
+    def test_status_rule_applies(self):
+        self.assertEqual(self.rate(company="noisy-co", status=503)[0], 100.0)
+
+    def test_route_rule_applies(self):
+        self.assertEqual(self.rate(route="/health")[0], 0.0)
+
+    def test_unmatched_traffic_gets_the_default(self):
+        self.assertEqual(self.rate(), (100.0, None))
+
+    def test_api_gateway_names_are_never_consulted(self):
+        # The same record, with API Gateway names bolted on carrying other values.
+        # Every rule must still read the Moesif fields.
+        record = dict(self.make(company="quiet-co", status=200, verb="GET"),
+                      **{"companyId": "noisy-co", "status": "503",
+                         "httpMethod": "DELETE", "resourcePath": "/health",
+                         "user": "heavy-user", "principalId": "heavy-user"})
+        self.assertEqual(lf.resolve_rate(record, lf._CONFIG), (100.0, None))
+
+    def test_a_missing_field_does_not_fall_back(self):
+        record = self.make()
+        del record["company_id"]
+        record["companyId"] = "noisy-co"
+        self.assertIs(lf.resolve_field(record, "company_id"), lf.MISSING)
+        self.assertEqual(lf.resolve_rate(record, lf._CONFIG), (100.0, None))
+
+    def test_sampling_runs_end_to_end(self):
+        random.seed(5)
+        traffic = ([self.make(company="noisy-co")] * 200
+                   + [self.make(company="noisy-co", status=500)] * 20
+                   + [self.make(route="/health")] * 30
+                   + [self.make()] * 50)
+        kept = keep_from(traffic)
+        self.assertLess(count(kept, lambda e: e["company_id"] == "noisy-co"
+                              and e["response"]["status"] == 200), 60)
+        self.assertEqual(count(kept, lambda e: e["response"]["status"] == 500), 20)
+        self.assertEqual(count(kept, lambda e: "/health" in e["request"]["uri"]), 0)
+        self.assertEqual(count(kept, lambda e: e["company_id"] == "quiet-co"), 50)
+
+
+class TestApiGatewayFormatSampling(RecordFormatCase):
+    """A stream of API Gateway records samples via the translated field names."""
+
+    def make(self, company="quiet-co", user="someone", verb="GET", status=200,
+             route="/v1/orders"):
+        return {"apiId": "a1", "requestId": "r1",
+                "requestTime": "07/Oct/2026:08:00:00 +0000", "protocol": "HTTP/1.1",
+                "httpMethod": verb, "resourcePath": route,
+                "requestHostHeader": "api.example.com", "requestUserAgentHeader": "got",
+                "status": str(status), "responseLength": "253", "durationMs": "12",
+                "companyId": company, "principalId": user, "ip": "1.2.3.4"}
+
+    def test_the_record_is_recognised_as_api_gateway(self):
+        self.assertTrue(lf.is_api_gateway_record(self.make()))
+
+    def test_company_rule_applies_via_companyId(self):
+        self.assertEqual(self.rate(company="noisy-co"), (10.0, "company:noisy-co"))
+
+    def test_user_rule_applies_via_principalId(self):
+        self.assertEqual(self.rate(user="heavy-user")[0], 50.0)
+
+    def test_status_rule_applies_via_status_string(self):
+        self.assertEqual(self.rate(company="noisy-co", status=503)[0], 100.0)
+
+    def test_route_rule_applies_via_resourcePath(self):
+        self.assertEqual(self.rate(route="/health")[0], 0.0)
+
+    def test_ip_is_matchable(self):
+        condition = lf._parse_condition(
+            {"path": "request.ip_address", "operator": "equals", "value": "1.2.3.4"})
+        self.assertTrue(lf._matches(condition, self.make()))
+
+    def test_unmatched_traffic_gets_the_default(self):
+        self.assertEqual(self.rate(), (100.0, None))
+
+    def test_sampling_runs_end_to_end(self):
+        random.seed(5)
+        traffic = ([self.make(company="noisy-co")] * 200
+                   + [self.make(company="noisy-co", status=500)] * 20
+                   + [self.make(route="/health")] * 30
+                   + [self.make()] * 50)
+        kept = keep_from(traffic)
+        self.assertLess(count(kept, lambda e: e["companyId"] == "noisy-co"
+                              and e["status"] == "200"), 60)
+        self.assertEqual(count(kept, lambda e: e["status"] == "500"), 20)
+        self.assertEqual(count(kept, lambda e: e["resourcePath"] == "/health"), 0)
+        self.assertEqual(count(kept, lambda e: e["companyId"] == "quiet-co"), 50)
+
+
+class TestBothFormatsAgree(unittest.TestCase):
+    """The same config must produce the same decisions in either format."""
+
+    def setUp(self):
+        lf._CONFIG = lf._from_moesif_config(SHARED_CONFIG)
+
+    def tearDown(self):
+        lf._CONFIG = None
+
+    def test_matching_records_resolve_to_the_same_rate(self):
+        moesif = TestMoesifFormatSampling()
+        apigw = TestApiGatewayFormatSampling()
+        cases = [{"company": "noisy-co"}, {"user": "heavy-user"},
+                 {"status": 503}, {"route": "/health"}, {}]
+        for case in cases:
+            a = lf.resolve_rate(moesif.make(**case), lf._CONFIG)
+            b = lf.resolve_rate(apigw.make(**case), lf._CONFIG)
+            self.assertEqual(a, b, case)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
